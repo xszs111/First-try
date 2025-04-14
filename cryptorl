@@ -1,0 +1,1165 @@
+import os
+import random
+import pandas as pd
+import numpy as np
+import gymnasium as gym
+from gymnasium import spaces
+import torch
+import torch.nn as nn
+from stable_baselines3 import PPO
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.vec_env import DummyVecEnv
+import pandas_ta as ta
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from sklearn.preprocessing import StandardScaler # 用于状态归一化
+
+
+# 设置随机种子，确保结果可复现
+def set_seed(seed=345):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+set_seed()
+
+# ==============================================================================
+# 0. 数据加载与预处理 (使用用户提供的代码)
+# ==============================================================================
+print("开始加载和预处理数据...")
+start_date = '2018-01-01'
+end_date = '2024-12-31' # 完整数据
+# 为了快速演示，先只用部分数据，例如到 2020 年底
+# end_date = '2020-12-31'
+symbol = 'BTCUSDT'
+interval = '15m' # 注意：用户数据是15分钟，但示例是1分钟，这里按15分钟处理
+
+# 准备数据
+# 数据文件路径 (请确保路径正确)
+file_path = f'd:/grad_data/raw/{symbol}_{interval}_{start_date}_{end_date}.csv'
+data = pd.read_csv(file_path, index_col=0, parse_dates=True)
+
+# 如果 Open time 是 index，就把它重设为普通列
+if data.index.name == 'Open time' or data.index.name == 'timestamp':
+    data.reset_index(inplace=True)
+print(data.columns)
+
+# 选取需要的列，并重命名为统一格式
+ohlcv = data[["Open time", "Open", "High", "Low", "Close", "Volume"]].copy()
+ohlcv.columns = ["timestamp", "open", "high", "low", "close", "volume"]
+
+# 转换时间戳为 datetime 类型
+ohlcv["timestamp"] = pd.to_datetime(ohlcv["timestamp"])
+
+
+# 确保数值列是 float 类型
+for col in ["open", "high", "low", "close", "volume"]:
+    ohlcv[col] = pd.to_numeric(ohlcv[col], errors='coerce')
+
+# 删除可能因转换错误产生的NaN行
+ohlcv.dropna(subset=["open", "high", "low", "close", "volume"], inplace=True)
+
+
+# 按时间排序
+ohlcv = ohlcv.sort_values("timestamp").reset_index(drop=True)
+
+# 预览数据
+print("数据预览 (前5行):")
+print(ohlcv.head())
+
+# ==============================================================================
+# 1. 特征工程: 计算技术指标
+# ==============================================================================
+print("开始计算技术指标...")
+def calculate_indicators(df):
+    """计算所需的技术指标"""
+    df_indicators = df.copy()
+    # RSI (Relative Strength Index)
+    df_indicators['RSI'] = ta.rsi(df_indicators['close'], length=164)
+    # MFI (Money Flow Index)
+    df_indicators['MFI'] = ta.mfi(df_indicators['high'], df_indicators['low'], df_indicators['close'], df_indicators['volume'], length=337)
+    # MACD (Moving Average Convergence Divergence)
+    macd = ta.macd(df_indicators['close'], fast=80, slow=120, signal=88)
+    if macd is not None and not macd.empty:
+        df_indicators['MACD'] = macd.iloc[:, 0] # MACD_12_26_9
+        df_indicators['MACD_signal'] = macd.iloc[:, 2] # MACDs_12_26_9
+        df_indicators['MACD_hist'] = macd.iloc[:, 1] # MACDh_12_26_9
+    else:
+        df_indicators['MACD'] = 0
+        df_indicators['MACD_signal'] = 0
+        df_indicators['MACD_hist'] = 0
+
+    # SMA (Simple Moving Average) - 这里用作特征，而非策略本身
+    df_indicators['SMA_50'] = ta.sma(df_indicators['close'], length=50)
+    df_indicators['SMA_200'] = ta.sma(df_indicators['close'], length=200)
+    # OBV (On-Balance Volume)
+    df_indicators['OBV'] = ta.obv(df_indicators['close'], df_indicators['volume'])
+
+    # 处理可能因计算产生的NaN值（例如窗口期不足）
+    df_indicators = df_indicators.fillna(method='ffill') # 先用前值填充
+    df_indicators = df_indicators.fillna(0) # 再用0填充开头的NaN
+
+    # 选择用于状态的指标列 (根据需要调整)
+    indicator_cols = ['RSI', 'MFI', 'MACD', 'MACD_signal', 'MACD_hist', 'SMA_50', 'SMA_200', 'OBV']
+    # 也可以加入价格变化率等 (价格变化率可能与归一化的价格特征有些重叠)
+    df_indicators['price_change'] = df_indicators['close'].pct_change().fillna(0)
+    df_indicators['volume_change'] = df_indicators['volume'].pct_change().fillna(0)
+    indicator_cols.extend(['price_change', 'volume_change'])
+
+    # 确保所有指标列都是数值类型
+    for col in indicator_cols:
+         df_indicators[col] = pd.to_numeric(df_indicators[col], errors='coerce').fillna(0)
+    # 新增：计算百分比回报率 z_t，用于奖励计算
+    df_indicators['returns'] = df_indicators['close'].pct_change().fillna(0)
+    return df_indicators, indicator_cols
+
+# 为整个数据集计算指标
+ohlcv_with_indicators, indicator_cols = calculate_indicators(ohlcv)
+print(f"已计算指标: {indicator_cols}")
+
+# 定义需要标准化的列 (OHLCV + 指标)
+# 注意：不标准化原始价格，而是将其作为状态的一部分（如果需要）或用于计算收益
+# 这里我们标准化 OHLCV 和 指标，作为输入给模型
+feature_cols_to_scale = ['open', 'high', 'low', 'close', 'volume'] + indicator_cols
+
+
+# 分割训练集和测试集 (使用带指标的数据)
+# 注意：对于时间序列，严格来说应该使用 Walk-Forward Validation 等方法进行更可靠的评估。
+# 这里的简单 Train/Test Split 主要用于演示。
+if len(ohlcv_with_indicators) < 100: # 假设最小需要100条数据
+    print("错误：数据量过少，无法进行训练和测试。")
+    exit()
+
+train_size = int(len(ohlcv_with_indicators) * 0.7)
+window_size = 128 # 定义窗口大小，用于检查训练集大小
+if train_size <= window_size:
+    print(f"警告：训练集大小 ({train_size}) 过小，可能不足以覆盖初始窗口。尝试增加数据量或减小训练集比例。")
+    train_size = window_size + 1 # 强制设置一个最小值
+    if train_size >= len(ohlcv_with_indicators):
+        print("错误：调整后训练集大小仍不足。")
+        exit()
+
+train_df_raw = ohlcv_with_indicators.iloc[:train_size].copy()
+test_df_raw = ohlcv_with_indicators.iloc[train_size:].reset_index(drop=True).copy()
+
+print(f"原始训练集大小: {len(train_df_raw)} 行")
+print(f"原始测试集大小: {len(test_df_raw)} 行")
+# --- 处理训练集和测试集中的无穷值 ---
+print("检查并处理训练集和测试集中的无穷值...")
+
+# 检查并处理训练集
+print(f"处理前训练集 Inf 数量: {np.isinf(train_df_raw[feature_cols_to_scale].values).sum()}") # 使用 .values 加速计算
+train_df_raw.replace([np.inf, -np.inf], np.nan, inplace=True) # 直接在 DataFrame 上替换
+# 先用前向填充，再用0填充可能在开头的NaN
+train_df_raw.fillna(method='ffill', inplace=True)
+train_df_raw.fillna(0, inplace=True) # 填充剩余的 NaN (通常是开头部分)
+print(f"处理后训练集 Inf 数量: {np.isinf(train_df_raw[feature_cols_to_scale].values).sum()}")
+print(f"处理后训练集 NaN 数量: {train_df_raw[feature_cols_to_scale].isna().sum().sum()}")
+
+
+# 检查并处理测试集 (使用相同方法)
+print(f"处理前测试集 Inf 数量: {np.isinf(test_df_raw[feature_cols_to_scale].values).sum()}")
+test_df_raw.replace([np.inf, -np.inf], np.nan, inplace=True)
+test_df_raw.fillna(method='ffill', inplace=True)
+test_df_raw.fillna(0, inplace=True)
+print(f"处理后测试集 Inf 数量: {np.isinf(test_df_raw[feature_cols_to_scale].values).sum()}")
+print(f"处理后测试集 NaN 数量: {test_df_raw[feature_cols_to_scale].isna().sum().sum()}")
+
+# --- 计算奖励归一化所需的统计量 (在训练集上计算) ---
+returns_train = train_df_raw['returns']
+# sigma_z: 回报率的标准差 (standard deviation)
+sigma_z = returns_train.std()
+# mu_abs_z: 回报率绝对值的均值 (mean of absolute values)
+mu_abs_z = returns_train.abs().mean()
+# 防止除零
+sigma_z = max(sigma_z, 1e-8)
+mu_abs_z = max(mu_abs_z, 1e-8)
+print(f"用于奖励归一化的统计量: sigma_z={sigma_z:.6f}, mu_abs_z={mu_abs_z:.6f}")
+
+# --- 状态归一化 ---
+print("对训练集拟合 StandardScaler 并应用于训练集和测试集...")
+scaler = StandardScaler()
+
+# 在处理了 Inf/NaN 的训练集上拟合 scaler
+# 再次检查 NaN，确保万无一失
+if train_df_raw[feature_cols_to_scale].isna().any().any():
+    print("错误：处理后训练集中仍存在 NaN 值，无法拟合 Scaler。请检查数据处理步骤。")
+    train_df_raw.fillna(0, inplace=True) # 最后尝试用0填充
+
+scaler.fit(train_df_raw[feature_cols_to_scale])
+
+# 应用 scaler 转换训练集和测试集
+train_df_scaled = train_df_raw.copy()
+test_df_scaled = test_df_raw.copy()
+
+train_df_scaled[feature_cols_to_scale] = scaler.transform(train_df_raw[feature_cols_to_scale])
+# 在 transform 之前也确保测试集没有 NaN
+if test_df_raw[feature_cols_to_scale].isna().any().any():
+     print("警告：处理后测试集中仍存在 NaN 值。将用0填充后进行 transform。")
+     test_df_raw.fillna(0, inplace=True)
+test_df_scaled[feature_cols_to_scale] = scaler.transform(test_df_raw[feature_cols_to_scale])
+
+print("数据标准化完成。")
+print("标准化后训练集预览 (部分列):")
+print(train_df_scaled[['close', 'RSI', 'OBV']].head())
+
+
+# ==============================================================================
+# 2. 强化学习交易环境 (TradingEnv)
+# ==============================================================================
+print("定义交易环境 TradingEnv (使用 Price Trailing 奖励)...")
+class TradingEnv(gym.Env):
+    """
+    一个用于加密货币交易的 Gym 环境 (v5 PriceTrailing Clarified)
+    - 使用预先标准化的数据
+    - 使用 Price Trailing 组合奖励 (简化版)
+
+    Args:
+        df (pd.DataFrame): 包含已标准化的 OHLCV 和指标的数据
+        df_raw (pd.DataFrame): 包含原始价格和回报率 ('returns') 的数据
+        indicator_cols (list): 用作状态一部分的指标列名列表 (已标准化)
+        window_size (int): 用于构建状态的回看时间窗口大小
+        initial_balance (float): 初始账户余额
+        commission_rate (float): 每次交易的手续费率
+        spread (float): 买卖价差的模拟百分比
+        leverage (float): 杠杆倍数
+        margin_call_threshold (float): 维持保证金率低于此值时触发爆仓
+        stop_loss_threshold (float): 可选的止损百分比
+        # Price Trailing 相关参数
+        pt_margin (float): 价格追踪的保证金比例 m (e.g., 0.02 for 2%)
+        pt_step (float): 智能体价格更新步长 v (e.g., 0.1 for 10%)
+        # 奖励权重
+        a_trail (float): 追踪奖励权重
+        a_pnl (float): PnL 奖励权重
+        a_fee (float): 交易费惩罚权重
+        # 奖励归一化统计量 (从训练集计算得到)
+        sigma_z (float): 训练集回报率标准差
+        mu_abs_z (float): 训练集回报率绝对值的均值
+    """
+    metadata = {'render_modes': ['human', 'ansi'], 'render_fps': 1}
+
+    # 更新: 修改 __init__ 默认值以匹配新参数
+    def __init__(self, df, df_raw, indicator_cols, window_size=64, initial_balance=10000.0,
+                 commission_rate=0.001, spread=0.0001, leverage=1.0, # 更新 spread, leverage
+                 margin_call_threshold=0.5, stop_loss_threshold=None,
+                 pt_margin=0.02, pt_step=0.01, # Price Trailing 参数默认值
+                 a_trail=0.2, a_pnl=0.7, a_fee=0.1, # 奖励权重默认值
+                 sigma_z=1.0, mu_abs_z=1.0 # 归一化统计量
+                 ):
+
+        super().__init__()
+
+        if df.empty or len(df) <= window_size or df_raw.empty or len(df_raw) != len(df):
+            raise ValueError("DataFrame 数据为空、长度不足或标准化与原始数据长度不匹配")
+        if 'returns' not in df_raw.columns:
+             raise ValueError("原始 DataFrame (df_raw) 缺少 'returns' 列")
+
+
+        self.df = df.copy()
+        self.df_raw = df_raw.copy()
+        self.indicator_cols = indicator_cols
+        self.window_size = window_size # 使用传入的 window_size
+        self.initial_balance = initial_balance
+        self.commission_rate = commission_rate
+        self.spread = spread # 使用传入的 spread
+        self.leverage = leverage # 使用传入的 leverage
+        self.margin_call_threshold = margin_call_threshold
+        self.stop_loss_threshold = stop_loss_threshold
+
+        # Price Trailing & Reward Params
+        self.pt_margin = pt_margin
+        self.pt_step = pt_step
+        self.a_trail = a_trail
+        self.a_pnl = a_pnl
+        self.a_fee = a_fee
+        # 存储从外部传入的归一化统计量
+        self.sigma_z = sigma_z
+        self.mu_abs_z = mu_abs_z
+
+        # 状态空间: [窗口内的标准化OHLCV, 窗口内的标准化指标, 持仓状态]
+        state_feature_dim = 5 + len(indicator_cols)
+        self.observation_shape = (window_size, state_feature_dim + 1)
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=self.observation_shape, dtype=np.float32)
+
+        # 动作空间: 0: Hold, 1: Long, 2: Short
+        self.action_space = spaces.Discrete(3)
+
+        self._validate_df()
+        self._reset_state()
+
+    def _validate_df(self):
+        # (保持不变)
+        required_cols_scaled = ['timestamp', 'open', 'high', 'low', 'close', 'volume'] + self.indicator_cols
+        for col in required_cols_scaled:
+            if col not in self.df.columns: raise ValueError(f"标准化 DataFrame 缺少必需列: {col}")
+            if not pd.api.types.is_numeric_dtype(self.df[col]) and col != 'timestamp': raise ValueError(f"标准化 DataFrame 列 '{col}' 必须是数值类型")
+        required_cols_raw = ['timestamp', 'open', 'high', 'low', 'close', 'volume', 'returns']
+        for col in required_cols_raw:
+            if col not in self.df_raw.columns: raise ValueError(f"原始 DataFrame 缺少必需列: {col}")
+            if not pd.api.types.is_numeric_dtype(self.df_raw[col]) and col != 'timestamp': raise ValueError(f"原始 DataFrame 列 '{col}' 必须是数值类型")
+
+
+    def _reset_state(self):
+        """重置环境内部状态"""
+        self.current_step = self.window_size
+        self.balance = self.initial_balance
+        self.equity = self.initial_balance
+        self.position = 0
+        self.last_position = 0
+        self.position_size = 0.0
+        self.entry_price = 0.0
+        self.margin_used = 0.0
+        self.total_fees = 0.0
+        self.trade_history = []
+        self.step_history = []
+        safe_start_index = min(self.current_step, len(self.df_raw) - 1)
+        self.agent_price = self.df_raw.iloc[safe_start_index]['close']
+
+    def reset(self, seed=None, options=None):
+        """重置环境到初始状态"""
+        super().reset(seed=seed)
+        self._reset_state()
+        observation = self._get_observation()
+        info = self._get_info()
+        self.step_history.append(info)
+        return observation, info
+
+    # _get_observation 方法保持不变
+    def _get_observation(self):
+        """获取当前时间步的状态 (使用预标准化的数据)"""
+        start_idx = max(0, self.current_step - self.window_size)
+        end_idx = self.current_step
+        obs_df = self.df.iloc[start_idx:end_idx] # 使用标准化后的 df
+
+        if len(obs_df) < self.window_size:
+            padding_size = self.window_size - len(obs_df)
+            padding_df = pd.DataFrame(np.zeros((padding_size, len(self.df.columns))), columns=self.df.columns)
+            obs_df = pd.concat([padding_df, obs_df], ignore_index=True)
+
+        obs = np.zeros(self.observation_shape, dtype=np.float32)
+        obs[:, 0] = obs_df['open'].values
+        obs[:, 1] = obs_df['high'].values
+        obs[:, 2] = obs_df['low'].values
+        obs[:, 3] = obs_df['close'].values
+        obs[:, 4] = obs_df['volume'].values
+        for i, col in enumerate(self.indicator_cols):
+             obs[:, 5 + i] = obs_df[col].values
+        obs[:, -1] = self.position # 使用当前的 self.position
+        return obs
+
+    # _get_info 方法保持不变
+    def _get_info(self):
+        """获取当前时间步的辅助信息"""
+        safe_step = min(self.current_step, len(self.df) - 1)
+        current_raw_price = self.df_raw.iloc[safe_step]['close']
+        return {
+            "step": self.current_step,
+            "timestamp": self.df.iloc[safe_step]['timestamp'],
+            "balance": self.balance,
+            "equity": self.equity,
+            "current_price_raw": current_raw_price,
+            "position": self.position,
+            "position_size": self.position_size,
+            "entry_price": self.entry_price,
+            "margin_used": self.margin_used,
+            "total_fees": self.total_fees,
+            "agent_price": self.agent_price
+        }
+
+    # _calculate_reward 方法保持不变 (已修复费用项)
+    def _calculate_reward(self):
+        """计算奖励信号 (Price Trailing 组合奖励) - v5 Clarified"""
+        safe_step = min(self.current_step, len(self.df_raw) - 1)
+        current_raw_price = self.df_raw.iloc[safe_step]['close']
+        current_return = self.df_raw.iloc[safe_step]['returns'] # z_t
+
+        # 1. 计算 Trailing Reward (r_trail)
+        target_price = current_raw_price
+        if target_price > 1e-8 and self.pt_margin > 1e-8:
+            price_diff_ratio = abs(self.agent_price - target_price) / (self.pt_margin * target_price)
+            r_trail_raw = max(0, 1 - price_diff_ratio)
+            if price_diff_ratio > 1: r_trail_raw = -price_diff_ratio # 超出边界惩罚
+        else: r_trail_raw = 0.0
+        # 归一化 Trailing Reward (依据文献式 9)
+        # r_trail * (mu_|z| / sigma_z)
+        r_trail_normalized = r_trail_raw * self.mu_abs_z / self.sigma_z
+
+        # 2. 计算 PnL Reward (r_pnl)
+        r_pnl_raw = self.position * current_return # delta_t * z_t
+        # 归一化 PnL Reward (依据文献式 7)
+        # r_pnl / sigma_z
+        r_pnl_normalized = r_pnl_raw / self.sigma_z
+
+        # 3. 计算 Fee Reward (r_fee)
+        position_change = abs(self.position - self.last_position) # 0, 1, or 2
+        # 原始费用惩罚 (与文献定义 -c * |delta_t - delta_{t-1}| 一致, c=commission_rate)
+        fee_penalty_raw = -self.commission_rate * position_change
+        # 归一化 Fee Reward (依据文献式 8)
+        # r_fee / sigma_z (注意：此归一化方式的理论依据可能需进一步探讨)
+        r_fee_normalized = fee_penalty_raw / self.sigma_z
+
+        # 4. 计算组合奖励 (依据文献式 10)
+        total_reward = (self.a_trail * r_trail_normalized +
+                        self.a_pnl * r_pnl_normalized +
+                        self.a_fee * r_fee_normalized) # 已加入费用项
+
+        return total_reward
+
+    # _apply_commission_and_spread 方法保持不变
+    def _apply_commission_and_spread(self, price_raw, size, is_buy):
+        """计算手续费和模拟价差影响 (使用原始价格)"""
+        commission = abs(size) * price_raw * self.commission_rate
+        if is_buy: effective_price_raw = price_raw * (1 + self.spread / 2)
+        else: effective_price_raw = price_raw * (1 - self.spread / 2)
+        cost_or_revenue = abs(size) * effective_price_raw
+        return commission, effective_price_raw, cost_or_revenue
+
+    # _update_position 方法保持不变 (Hold=NoChange)
+    def _update_position(self, action):
+        """根据动作更新持仓状态，并更新 agent_price (v5 Fix: Hold=NoChange)"""
+        if self.current_step >= len(self.df):
+             print(f"警告: _update_position 尝试访问超出范围的索引 {self.current_step}")
+             current_raw_price = self.df_raw.iloc[-1]['close']
+        else:
+             current_raw_price = self.df_raw.iloc[self.current_step]['close']
+
+        self.last_position = self.position
+        step_pnl = 0.0; fees = 0.0; executed_price_raw = current_raw_price; trade_size = 0
+
+        if self.equity > 0 and self.leverage > 0:
+            trade_amount_usd = self.equity * 0.9 / self.leverage # 使用杠杆计算可交易名义价值
+            trade_amount_usd = max(trade_amount_usd, 1e-6)
+        else: trade_amount_usd = 0
+
+        target_position = self.position # Hold=NoChange
+        if action == 1: target_position = 1
+        elif action == 2: target_position = -1
+
+        # 平仓逻辑 (仅当目标与当前相反)
+        if self.position != 0 and target_position != self.position and target_position != 0:
+            if self.position == 1: # 平多
+                step_pnl = (current_raw_price - self.entry_price) * abs(self.position_size)
+                fees_close, executed_price_close_raw, _ = self._apply_commission_and_spread(current_raw_price, abs(self.position_size), is_buy=False)
+                self.balance += step_pnl - fees_close; self.total_fees += fees_close
+                self._record_trade(action="Close Long", price=executed_price_close_raw, size=abs(self.position_size), fees=fees_close, pnl=step_pnl)
+                self.position = 0; self.position_size = 0; self.entry_price = 0; self.margin_used = 0; fees += fees_close
+            elif self.position == -1: # 平空
+                step_pnl = (self.entry_price - current_raw_price) * abs(self.position_size)
+                fees_close, executed_price_close_raw, _ = self._apply_commission_and_spread(current_raw_price, abs(self.position_size), is_buy=True)
+                self.balance += step_pnl - fees_close; self.total_fees += fees_close
+                self._record_trade(action="Close Short", price=executed_price_close_raw, size=abs(self.position_size), fees=fees_close, pnl=step_pnl)
+                self.position = 0; self.position_size = 0; self.entry_price = 0; self.margin_used = 0; fees += fees_close
+
+        # 开仓逻辑 (仅当当前空仓且目标非空)
+        if self.position == 0 and target_position != 0:
+            if target_position == 1 and trade_amount_usd > 0 and current_raw_price > 0: # 开多
+                trade_size = trade_amount_usd / current_raw_price
+                fees_open, executed_price_open_raw, cost = self._apply_commission_and_spread(current_raw_price, trade_size, is_buy=True)
+                required_margin = cost / self.leverage # 保证金基于实际成本
+                if self.balance >= required_margin + fees_open:
+                    self.position = 1; self.position_size = trade_size; self.entry_price = executed_price_open_raw
+                    self.margin_used = required_margin; self.balance -= fees_open; self.total_fees += fees_open
+                    self._record_trade(action="Open Long", price=executed_price_open_raw, size=trade_size, fees=fees_open, pnl=0)
+                    fees += fees_open; executed_price_raw = executed_price_open_raw
+            elif target_position == -1 and trade_amount_usd > 0 and current_raw_price > 0: # 开空
+                trade_size = trade_amount_usd / current_raw_price
+                fees_open, executed_price_open_raw, revenue = self._apply_commission_and_spread(current_raw_price, trade_size, is_buy=False)
+                required_margin = revenue / self.leverage # 保证金基于名义价值
+                if self.balance >= required_margin + fees_open:
+                    self.position = -1; self.position_size = trade_size; self.entry_price = executed_price_open_raw
+                    self.margin_used = required_margin; self.balance -= fees_open; self.total_fees += fees_open
+                    self._record_trade(action="Open Short", price=executed_price_open_raw, size=trade_size, fees=fees_open, pnl=0)
+                    fees += fees_open; executed_price_raw = executed_price_open_raw
+
+        # 更新 Agent Price
+        target_price = current_raw_price
+        if target_price > 1e-8 and self.pt_margin > 1e-8:
+            upper_margin = target_price * (1 + self.pt_margin); lower_margin = target_price * (1 - self.pt_margin)
+            if self.position == 1: self.agent_price += self.pt_step * abs(upper_margin - self.agent_price)
+            elif self.position == -1: self.agent_price -= self.pt_step * abs(self.agent_price - lower_margin)
+            self.agent_price = np.clip(self.agent_price, lower_margin + 1e-9, upper_margin - 1e-9)
+            self.agent_price = max(self.agent_price, 1e-9)
+
+        # 更新权益和检查爆仓
+        unrealized_pnl = 0
+        if self.current_step < len(self.df): current_raw_price_for_pnl = self.df_raw.iloc[self.current_step]['close']
+        else: current_raw_price_for_pnl = self.df_raw.iloc[-1]['close']
+        if self.position == 1: unrealized_pnl = (current_raw_price_for_pnl - self.entry_price) * abs(self.position_size)
+        elif self.position == -1: unrealized_pnl = (self.entry_price - current_raw_price_for_pnl) * abs(self.position_size)
+        self.equity = self.balance + unrealized_pnl
+
+        # 爆仓和止损检查逻辑 (保持不变)
+        terminated = False
+        if self.position != 0 and self.margin_used > 1e-8:
+            maintenance_margin_ratio = self.equity / self.margin_used
+            if maintenance_margin_ratio < self.margin_call_threshold:
+                print(f"--- 爆仓! Step: {self.current_step}, Equity: {self.equity:.2f}, Margin Used: {self.margin_used:.2f}, Ratio: {maintenance_margin_ratio:.4f} < {self.margin_call_threshold} ---")
+                liquidation_pnl = unrealized_pnl; self.balance = self.equity
+                self._record_trade(action="Liquidation", price=current_raw_price_for_pnl, size=abs(self.position_size), fees=0, pnl=liquidation_pnl)
+                self.position = 0; self.position_size = 0; self.entry_price = 0; self.margin_used = 0
+                self.equity = max(0, self.balance); self.balance = self.equity; terminated = True
+
+        if not terminated and self.stop_loss_threshold is not None and self.position != 0 and self.margin_used > 1e-8:
+             pnl_ratio = unrealized_pnl / self.margin_used
+             if pnl_ratio < -self.stop_loss_threshold:
+                 print(f"--- 止损! Step: {self.current_step}, PNL Ratio: {pnl_ratio:.2f} < {-self.stop_loss_threshold} ---")
+                 sl_fees = 0; sl_pnl = 0; sl_price = current_raw_price_for_pnl
+                 if self.position == 1: # 平多
+                     sl_pnl = (sl_price - self.entry_price) * abs(self.position_size)
+                     sl_fees, sl_exec_price, _ = self._apply_commission_and_spread(sl_price, abs(self.position_size), is_buy=False)
+                     self._record_trade(action="Stop Loss Long", price=sl_exec_price, size=abs(self.position_size), fees=sl_fees, pnl=sl_pnl)
+                 elif self.position == -1: # 平空
+                     sl_pnl = (self.entry_price - sl_price) * abs(self.position_size)
+                     sl_fees, sl_exec_price, _ = self._apply_commission_and_spread(sl_price, abs(self.position_size), is_buy=True)
+                     self._record_trade(action="Stop Loss Short", price=sl_exec_price, size=abs(self.position_size), fees=sl_fees, pnl=sl_pnl)
+                 self.balance += sl_pnl - sl_fees; self.total_fees += sl_fees
+                 self.position = 0; self.position_size = 0; self.entry_price = 0; self.margin_used = 0
+                 self.equity = self.balance
+
+        if self.equity <= 1e-6:
+            if not terminated:
+                print(f"--- 权益耗尽! Step: {self.current_step}, Equity: {self.equity:.2f} ---")
+                self.balance = 0; self.equity = 0
+                if self.position != 0:
+                     self._record_trade(action="Equity Zero Close", price=current_raw_price_for_pnl, size=abs(self.position_size), fees=0, pnl=unrealized_pnl)
+                     self.position = 0; self.position_size = 0; self.entry_price = 0; self.margin_used = 0
+                terminated = True
+
+        return terminated, step_pnl
+
+    # _record_trade 方法保持不变
+    def _record_trade(self, action, price, size, fees, pnl):
+        """记录交易详情 (使用原始价格)"""
+        safe_step = min(self.current_step, len(self.df) - 1)
+        self.trade_history.append({
+            "step": self.current_step,
+            "timestamp": self.df.iloc[safe_step]['timestamp'],
+            "action": action,
+            "price": price, # 记录的是原始执行价格
+            "size": size,
+            "fees": fees,
+            "step_pnl": pnl,
+            "balance": self.balance,
+            "equity": self.equity,
+            "position": self.position
+        })
+
+    # step 方法更新，使用新的奖励函数
+    def step(self, action):
+        """执行一个时间步 (使用 Price Trailing 组合奖励)"""
+        if self.current_step >= len(self.df) - 1:
+             obs = self._get_observation()
+             info = self._get_info()
+             return obs, 0.0, True, True, info
+
+        terminated = False
+        truncated = False
+
+        # 应用动作，更新持仓，计算已实现盈亏，并更新 agent_price
+        terminated, step_pnl = self._update_position(action)
+
+        # 计算 Price Trailing 组合奖励
+        reward = self._calculate_reward()
+        # self.last_equity 在这里不再直接用于奖励计算
+
+        # 记录当前步的信息
+        info = self._get_info()
+        self.step_history.append(info)
+
+        # 移动到下一个时间步
+        self.current_step += 1
+
+        # 检查是否到达数据末尾并处理最终平仓
+        if self.current_step >= len(self.df):
+            truncated = True
+            if self.position != 0 and not terminated:
+                final_raw_price = self.df_raw.iloc[-1]['close']
+                final_pnl = 0; final_fees = 0
+                if self.position == 1:
+                    final_pnl = (final_raw_price - self.entry_price) * abs(self.position_size)
+                    final_fees, final_exec_price, _ = self._apply_commission_and_spread(final_raw_price, abs(self.position_size), is_buy=False)
+                    self._record_trade(action="End Close Long", price=final_exec_price, size=abs(self.position_size), fees=final_fees, pnl=final_pnl)
+                elif self.position == -1:
+                    final_pnl = (self.entry_price - final_raw_price) * abs(self.position_size)
+                    final_fees, final_exec_price, _ = self._apply_commission_and_spread(final_raw_price, abs(self.position_size), is_buy=True)
+                    self._record_trade(action="End Cover Short", price=final_exec_price, size=abs(self.position_size), fees=final_fees, pnl=final_pnl)
+
+                if not terminated:
+                    self.balance += final_pnl - final_fees
+                    self.total_fees += final_fees
+                    self.position = 0; self.position_size = 0; self.entry_price = 0; self.margin_used = 0
+                    self.equity = self.balance
+
+        # 获取下一个状态
+        observation = self._get_observation()
+        # 更新 info
+        info = self._get_info()
+
+        # 结束惩罚
+        if terminated and self.equity <= 1e-6:
+            # 惩罚值可以根据 reward_scaling 调整，或者设为一个固定的负值
+            reward -= 1.0 # 例如，一个固定的负奖励
+
+        return observation, reward, terminated, truncated, info
+
+    # render 和 close 方法保持不变
+    def render(self, mode='human'):
+        safe_step = min(self.current_step, len(self.df) - 1)
+        if mode == 'human':
+            print(f"Step: {self.current_step}, Timestamp: {self.df.iloc[safe_step]['timestamp']}")
+            print(f"  Balance: {self.balance:.2f}, Equity: {self.equity:.2f}, Position: {self.position} ({self.position_size:.4f} @ {self.entry_price:.2f})")
+            print(f"  Margin Used: {self.margin_used:.2f}, Total Fees: {self.total_fees:.2f}")
+        elif mode == 'ansi':
+            return f"Step: {self.current_step}, Equity: {self.equity:.2f}, Position: {self.position}"
+
+    def close(self):
+        print("环境关闭。")
+
+
+# ==============================================================================
+# 3. 自定义 PPO 网络架构 (LSTM + Self-Attention)
+# ==============================================================================
+# LstmAttentionExtractor 类保持不变 (使用 Tanh 激活)
+print("定义自定义网络架构 LstmAttentionExtractor (使用 Tanh 激活)...")
+class LstmAttentionExtractor(BaseFeaturesExtractor):
+    """
+    结合 LSTM 和 Self-Attention 的特征提取器 for PPO (v4 RiskAdjPnL)
+    - 最后全连接层后使用 Tanh 激活函数
+
+    Args:
+        observation_space (gym.Space): 环境的观测空间
+        features_dim (int): 输出特征向量的维度
+        lstm_hidden_size (int): LSTM 隐藏层大小
+        n_lstm_layers (int): LSTM 层数
+        n_attention_heads (int): Self-Attention 头数
+    """
+    # 更新: 修改 n_attention_heads 默认值
+    def __init__(self, observation_space: spaces.Box, features_dim: int = 256,
+                 lstm_hidden_size: int = 128, n_lstm_layers: int = 2, n_attention_heads: int = 4): # 更新默认值
+        super().__init__(observation_space, features_dim)
+
+        if len(observation_space.shape) != 2:
+             raise ValueError(f"Expected observation space shape of (window_size, num_features), got {observation_space.shape}")
+
+        self.window_size, self.input_features = observation_space.shape
+        self.lstm_hidden_size = lstm_hidden_size
+        self.n_lstm_layers = n_lstm_layers
+
+        self.lstm = nn.LSTM(input_size=self.input_features, hidden_size=lstm_hidden_size,
+                            num_layers=n_lstm_layers, batch_first=True)
+
+        attention_embed_dim = lstm_hidden_size
+        if attention_embed_dim <= 0: raise ValueError(f"LSTM hidden size must be positive, got {attention_embed_dim}")
+        # 使用传入的 n_attention_heads
+        current_n_attention_heads = n_attention_heads
+        if current_n_attention_heads <= 0: current_n_attention_heads = 1
+        while attention_embed_dim % current_n_attention_heads != 0 and current_n_attention_heads > 1: current_n_attention_heads -= 1
+        if attention_embed_dim % current_n_attention_heads != 0:
+             current_n_attention_heads = 1
+             print(f"警告: LSTM隐藏层大小 {attention_embed_dim} 不能被注意力头数 {n_attention_heads} 整除。将头数调整为 {current_n_attention_heads}。")
+        self.n_attention_heads = current_n_attention_heads
+
+        self.attention = nn.MultiheadAttention(embed_dim=attention_embed_dim, num_heads=self.n_attention_heads, batch_first=True)
+        self.fc = nn.Linear(attention_embed_dim, features_dim)
+        self.tanh = nn.Tanh()
+
+    def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        if observations.dtype != torch.float32: observations = observations.float()
+        lstm_out, _ = self.lstm(observations)
+        attn_output, attn_weights = self.attention(lstm_out, lstm_out, lstm_out)
+        last_step_attn_output = attn_output[:, -1, :]
+        features = self.tanh(self.fc(last_step_attn_output))
+        return features
+
+# ==============================================================================
+# 4. 交易 Agent 训练 (PPO)
+# ==============================================================================
+print("准备训练 PPO Agent (Price Trailing 奖励)...")
+
+# --- 环境准备 ---
+# 定义 Price Trailing 和奖励权重超参数 (需要调整)
+pt_margin = 0.02 # 2% 边距
+pt_step = 0.01 # 1% 步长
+a_trail = 0.2 # 追踪奖励权重
+a_pnl = 0.7   # PnL 奖励权重
+a_fee = 0.1   # 费用惩罚权重
+
+try:
+    # 创建训练环境实例 (使用 Price Trailing 奖励)
+    train_env = TradingEnv(
+        df=train_df_scaled,
+        df_raw=train_df_raw,
+        indicator_cols=indicator_cols,
+        window_size=window_size, # 使用更新后的 window_size = 128
+        initial_balance=10000,
+        commission_rate=0.001,
+        spread=0.0001, # 更新 spread
+        leverage=1.0, # 更新 leverage
+        margin_call_threshold=0.5,
+        pt_margin=pt_margin,
+        pt_step=pt_step,
+        a_trail=a_trail,
+        a_pnl=a_pnl,
+        a_fee=a_fee,
+        sigma_z=sigma_z, # 使用从训练集计算的值
+        mu_abs_z=mu_abs_z # 使用从训练集计算的值
+    )
+    train_vec_env = DummyVecEnv([lambda: train_env])
+    print("训练环境创建成功。")
+except ValueError as e:
+    print(f"创建训练环境时出错: {e}")
+    exit()
+
+
+# --- 模型定义 ---
+policy_kwargs = dict(
+    features_extractor_class=LstmAttentionExtractor,
+    # 更新: 传递 n_attention_heads
+    features_extractor_kwargs=dict(features_dim=256, lstm_hidden_size=128, n_lstm_layers=2, n_attention_heads=4),
+    activation_fn=torch.nn.Tanh,
+    ortho_init=True,
+)
+
+# PPO 模型参数
+ppo_params = {
+    "policy": "MlpPolicy",
+    "env": train_vec_env,
+    "policy_kwargs": policy_kwargs,
+    "learning_rate": 3e-4,
+    "n_steps": 1024,
+    "batch_size": 64, # 更新 batch_size
+    "n_epochs": 10,
+    "gamma": 0.99,
+    "gae_lambda": 0.95,
+    "clip_range": 0.2,
+    "ent_coef": 0.01,
+    "vf_coef": 0.5,
+    "max_grad_norm": 0.5,
+    "verbose": 1,
+    "device": "cuda" if torch.cuda.is_available() else "cpu"
+    # 注意: Advantage Normalization 默认开启
+}
+print(f"将使用设备: {ppo_params['device']}")
+
+model = PPO(**ppo_params)
+
+# --- 模型训练 ---
+total_timesteps = 100000 # 更新 total_timesteps
+model_save_path = "./ppo_crypto_trader_ptrail_tuned" # 新的模型文件名
+
+print(f"开始训练 PPO 模型 (Price Trailing 奖励)，总步数: {total_timesteps}...")
+# SimpleCallback 类保持不变
+class SimpleCallback(BaseCallback):
+    def __init__(self, check_freq: int, verbose=1):
+        super(SimpleCallback, self).__init__(verbose)
+        self.check_freq = check_freq
+        self.timesteps_elapsed = 0
+    def _on_step(self) -> bool:
+        self.timesteps_elapsed += 1
+        if self.timesteps_elapsed % self.check_freq == 0:
+            print(f"训练步数: {self.num_timesteps}/{total_timesteps}")
+        return True
+
+try:
+    model.learn(total_timesteps=total_timesteps, callback=SimpleCallback(check_freq=ppo_params['n_steps']), progress_bar=True, reset_num_timesteps=True)
+    model.save(model_save_path)
+    print(f"模型训练完成并保存到 {model_save_path}.zip")
+except Exception as e:
+    print(f"训练过程中发生错误: {e}")
+    print("将尝试加载已保存的模型（如果存在）进行评估...")
+    if not os.path.exists(f"{model_save_path}.zip"):
+        print("错误：没有找到已保存的模型，无法继续评估。")
+        exit()
+
+
+# ==============================================================================
+# 5. 基准策略 (Baseline Strategies)
+# ==============================================================================
+# hodl_strategy 和 sma_crossover_strategy 函数保持不变
+print("定义基准策略...")
+
+def hodl_strategy(df_raw, initial_balance=10000.0, commission_rate=0.001):
+    """买入持有策略 (使用原始数据 df_raw)"""
+    if df_raw.empty:
+        print("HODL 策略错误：输入数据为空。")
+        return {}, pd.DataFrame(), initial_balance
+
+    balance = initial_balance
+    position_size = 0
+    entry_price = df_raw.iloc[0]['close']
+    fees = 0
+    history = [] # 用于记录权益变化
+
+    if entry_price > 0:
+        cost = balance
+        fees = cost * commission_rate
+        position_size = (balance - fees) / entry_price
+        balance = 0
+        history.append({'timestamp': df_raw.iloc[0]['timestamp'], 'action': 'Buy', 'price': entry_price, 'equity': initial_balance - fees})
+    else:
+        position_size = 0
+        history.append({'timestamp': df_raw.iloc[0]['timestamp'], 'action': 'Hold', 'price': entry_price, 'equity': initial_balance})
+
+    equity = initial_balance - fees
+    for i in range(1, len(df_raw)):
+         current_price = df_raw.iloc[i]['close']
+         current_time = df_raw.iloc[i]['timestamp']
+         equity = position_size * current_price
+         history.append({'timestamp': current_time, 'action': 'Hold', 'price': current_price, 'equity': equity})
+
+    final_equity = equity
+    history_df = pd.DataFrame(history).set_index('timestamp')
+    returns = history_df['equity'].pct_change().dropna()
+    std_dev = returns.std()
+    if len(returns) > 1 and std_dev > 1e-8:
+        sharpe_ratio = (returns.mean() / std_dev) * np.sqrt(365 * 24 * 4)
+    else: sharpe_ratio = 0.0
+
+    total_return = (final_equity / initial_balance) - 1 if initial_balance > 0 else 0
+    cum_returns = history_df['equity'] / initial_balance if initial_balance > 0 else pd.Series([1.0]*len(history_df), index=history_df.index)
+    peak = cum_returns.cummax()
+    drawdown = (cum_returns - peak) / peak
+    max_drawdown = drawdown.min() if not drawdown.empty else 0
+
+    results = {"Total Return": total_return, "Sharpe Ratio": sharpe_ratio, "Max Drawdown": max_drawdown, "Win Rate": np.nan, "Total Fees": fees}
+    return results, history_df.reset_index(), final_equity
+
+def sma_crossover_strategy(df_raw, initial_balance=10000.0, commission_rate=0.001,
+                           short_window=20, long_window=50): # 默认值保持不变
+    """简单移动平均线交叉策略 (支持多空)"""
+    if df_raw.empty: return {}, pd.DataFrame(), pd.DataFrame(), initial_balance
+
+    balance = initial_balance
+    position = 0 # 0: 空仓, 1: 持有多头, -1: 持有空头
+    position_size = 0.0
+    entry_price = 0.0
+    equity = initial_balance
+    total_fees = 0.0
+    step_history = []
+    trade_history = []
+
+    df_strat = df_raw.copy()
+    # 使用传入的 window 参数
+    df_strat['SMA_short'] = ta.sma(df_strat['close'], length=short_window)
+    df_strat['SMA_long'] = ta.sma(df_strat['close'], length=long_window)
+    df_strat = df_strat.dropna(subset=['SMA_short', 'SMA_long']).reset_index(drop=True)
+    if df_strat.empty: return {}, pd.DataFrame(), pd.DataFrame(), initial_balance
+
+    step_history.append({'timestamp': df_strat.iloc[0]['timestamp'], 'equity': initial_balance})
+
+    for i in range(1, len(df_strat)):
+        current_price = df_strat.iloc[i]['close']
+        current_time = df_strat.iloc[i]['timestamp']
+        signal = 0
+        if i > 0:
+            sma_short_prev = df_strat.iloc[i-1]['SMA_short']; sma_long_prev = df_strat.iloc[i-1]['SMA_long']
+            sma_short_curr = df_strat.iloc[i]['SMA_short']; sma_long_curr = df_strat.iloc[i]['SMA_long']
+            if sma_short_prev < sma_long_prev and sma_short_curr > sma_long_curr: signal = 1 # 金叉
+            elif sma_short_prev > sma_long_prev and sma_short_curr < sma_long_curr: signal = -1 # 死叉
+
+        action_taken = "Hold"; trade_price = np.nan; step_pnl = 0; fees = 0
+
+        # --- 执行交易逻辑 ---
+        # 金叉信号
+        if signal == 1:
+            if position == -1: # 如果持有空头，平仓
+                step_pnl = (entry_price - current_price) * abs(position_size)
+                fees = abs(position_size) * current_price * commission_rate # 平空是买入
+                balance += step_pnl - fees
+                total_fees += fees
+                action_taken = "Cover Short"; trade_price = current_price
+                trade_history.append({'timestamp': current_time, 'action': action_taken, 'price': trade_price, 'fees': fees, 'pnl': step_pnl})
+                position = 0; position_size = 0; entry_price = 0
+            if position == 0 and balance > 0: # 如果空仓，开多仓
+                cost = balance # 用全部余额开仓
+                fees = cost * commission_rate
+                if current_price > 0:
+                    position_size = (balance - fees) / current_price
+                    balance = 0
+                    total_fees += fees
+                    position = 1
+                    entry_price = current_price
+                    action_taken = "Open Long"; trade_price = current_price
+                    trade_history.append({'timestamp': current_time, 'action': action_taken, 'price': trade_price, 'fees': fees, 'pnl': 0})
+
+        # 死叉信号
+        elif signal == -1:
+            if position == 1: # 如果持有多头，平仓
+                step_pnl = (current_price - entry_price) * abs(position_size)
+                fees = abs(position_size) * current_price * commission_rate # 平多是卖出
+                balance += (position_size * current_price) - fees # 收到卖出金额，减去费用
+                total_fees += fees
+                action_taken = "Close Long"; trade_price = current_price
+                trade_history.append({'timestamp': current_time, 'action': action_taken, 'price': trade_price, 'fees': fees, 'pnl': step_pnl})
+                position = 0; position_size = 0; entry_price = 0
+            if position == 0 and balance > 0: # 如果空仓，开空仓
+                # 假设可以裸空，保证金要求简化为与做多相同（实际需要更复杂模型）
+                cost = balance # 名义价值等于余额
+                fees = cost * commission_rate
+                if current_price > 0:
+                    position_size = (balance - fees) / current_price # 借入并卖出的数量
+                    balance = balance + (position_size * current_price) - fees # 余额增加卖出所得，减去费用 (简化模型)
+                    total_fees += fees
+                    position = -1
+                    entry_price = current_price
+                    action_taken = "Open Short"; trade_price = current_price
+                    trade_history.append({'timestamp': current_time, 'action': action_taken, 'price': trade_price, 'fees': fees, 'pnl': 0})
+
+        # 更新当前步的权益
+        unrealized_pnl = 0
+        if position == 1: unrealized_pnl = (current_price - entry_price) * abs(position_size)
+        elif position == -1: unrealized_pnl = (entry_price - current_price) * abs(position_size)
+        equity = balance + unrealized_pnl # 简化：未考虑空头保证金占用和利息
+        step_history.append({'timestamp': current_time, 'equity': equity})
+
+
+    # 结束时强制平仓
+    final_price = df_strat.iloc[-1]['close']; current_time = df_strat.iloc[-1]['timestamp']
+    if position == 1: # 平多
+        step_pnl = (final_price - entry_price) * abs(position_size)
+        fees = abs(position_size) * final_price * commission_rate
+        balance += (position_size * final_price) - fees; total_fees += fees
+        action_taken = "End Close Long"; trade_price = final_price
+        trade_history.append({'timestamp': current_time, 'action': action_taken, 'price': trade_price, 'fees': fees, 'pnl': step_pnl})
+    elif position == -1: # 平空
+        step_pnl = (entry_price - final_price) * abs(position_size)
+        fees = abs(position_size) * final_price * commission_rate
+        balance += step_pnl - fees; total_fees += fees # 归还借入资产后的余额变化
+        action_taken = "End Cover Short"; trade_price = final_price
+        trade_history.append({'timestamp': current_time, 'action': action_taken, 'price': trade_price, 'fees': fees, 'pnl': step_pnl})
+    position = 0; position_size = 0; entry_price = 0; equity = balance
+    if step_history: step_history[-1]['equity'] = equity
+
+    final_equity = equity
+    step_history_df = pd.DataFrame(step_history).set_index('timestamp')
+    returns = step_history_df['equity'].pct_change().dropna()
+    std_dev = returns.std()
+    if len(returns) > 1 and std_dev > 1e-8: sharpe_ratio = (returns.mean() / std_dev) * np.sqrt(365 * 24 * 4)
+    else: sharpe_ratio = 0.0
+
+    total_return = (final_equity / initial_balance) - 1 if initial_balance > 0 else 0
+    cum_returns = step_history_df['equity'] / initial_balance if initial_balance > 0 else pd.Series([1.0]*len(step_history_df), index=step_history_df.index)
+    peak = cum_returns.cummax(); drawdown = (cum_returns - peak) / peak
+    max_drawdown = drawdown.min() if not drawdown.empty else 0
+
+    # 胜率计算 (包含多空)
+    trade_history_df = pd.DataFrame(trade_history)
+    wins = 0
+    total_trades = 0
+    # 查找所有平仓交易
+    close_trades = trade_history_df[trade_history_df['action'].str.contains("Close|Cover|End", case=False)]
+    wins = close_trades[close_trades['pnl'] > 0].shape[0]
+    total_trades = len(close_trades)
+    win_rate = wins / total_trades if total_trades > 0 else 0
+
+    results = {"Total Return": total_return, "Sharpe Ratio": sharpe_ratio, "Max Drawdown": max_drawdown, "Win Rate": win_rate, "Total Fees": total_fees}
+    return results, step_history_df.reset_index(), trade_history_df, final_equity
+
+
+# ==============================================================================
+# 6. 评估模块 (Evaluate)
+# ==============================================================================
+# evaluate_agent 函数保持不变
+print("定义评估模块...")
+
+def evaluate_agent(agent, env):
+    """评估训练好的 Agent"""
+    obs, info = env.reset()
+    terminated = False; truncated = False; total_reward = 0.0
+
+    while not terminated and not truncated:
+        action, _states = agent.predict(obs, deterministic=True)
+        obs, reward, terminated, truncated, info = env.step(action)
+        total_reward += reward
+
+    trade_history_df = pd.DataFrame(env.trade_history)
+    step_history_df = pd.DataFrame(env.step_history)
+    final_equity = env.equity
+
+    if not step_history_df.empty:
+         equity_curve = step_history_df.set_index('timestamp')['equity']
+         returns = equity_curve.pct_change().dropna()
+         std_dev = returns.std()
+         if len(returns) > 1 and std_dev > 1e-8:
+             days = (step_history_df['timestamp'].iloc[-1] - step_history_df['timestamp'].iloc[0]).days
+             days = max(days, 1)
+             steps_per_year = (365.0 / days) * len(returns)
+             sharpe_ratio = (returns.mean() / std_dev) * np.sqrt(steps_per_year)
+         else: sharpe_ratio = 0.0
+
+         total_return = (final_equity / env.initial_balance) - 1 if env.initial_balance > 0 else 0
+         cum_returns = equity_curve / env.initial_balance if env.initial_balance > 0 else pd.Series([1.0]*len(equity_curve), index=equity_curve.index)
+         peak = cum_returns.cummax(); drawdown = (cum_returns - peak) / peak
+         max_drawdown = drawdown.min() if not drawdown.empty else 0
+
+         if not trade_history_df.empty:
+             trades = trade_history_df[trade_history_df['action'].str.contains("Close|Cover|Liquidation|Stop Loss|End", case=False)] # 更新匹配规则
+             wins = trades[trades['step_pnl'] > 0].shape[0]; losses = trades[trades['step_pnl'] < 0].shape[0]
+             total_trades = wins + losses; win_rate = wins / total_trades if total_trades > 0 else 0.0
+         else: win_rate = 0.0
+
+         results = {"Total Return": total_return, "Sharpe Ratio": sharpe_ratio, "Max Drawdown": max_drawdown, "Win Rate": win_rate, "Total Fees": env.total_fees, "Total Reward": total_reward}
+    else:
+         results = {"Total Return": 0, "Sharpe Ratio": 0, "Max Drawdown": 0, "Win Rate": np.nan, "Total Fees": 0, "Total Reward": 0}
+
+    return results, step_history_df, trade_history_df, final_equity
+
+# ==============================================================================
+# 7. 可视化模块
+# ==============================================================================
+# plot_trading_results 函数保持不变
+print("定义可视化模块...")
+
+def plot_trading_results(df_price_raw, step_history_df, trade_history_df, title="交易结果"):
+    """可视化交易轨迹和性能 (使用原始价格绘图)"""
+    if step_history_df.empty:
+        print(f"无法绘制 '{title}': 没有有效的历史数据。")
+        return
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(15, 10), sharex=True, gridspec_kw={'height_ratios': [3, 1]})
+    fig.suptitle(title, fontsize=16)
+    # 修改 Matplotlib 样式使用
+    try:
+        plt.style.use('seaborn-v0_8-darkgrid') # 尝试 v0.8 风格
+    except OSError:
+        try:
+            plt.style.use('seaborn-darkgrid') # 尝试旧版风格
+        except OSError:
+            print("警告：无法加载 'seaborn-v0_8-darkgrid' 或 'seaborn-darkgrid' 样式，将使用默认样式。")
+
+    start_time = step_history_df['timestamp'].min(); end_time = step_history_df['timestamp'].max()
+    plot_price_df = df_price_raw[(df_price_raw['timestamp'] >= start_time) & (df_price_raw['timestamp'] <= end_time)]
+
+    ax1.plot(plot_price_df['timestamp'], plot_price_df['close'], label='收盘价 (原始)', color='skyblue', linewidth=1) # 使用原始价格
+
+    if not trade_history_df.empty:
+        trade_history_plot = trade_history_df.dropna(subset=['timestamp', 'price'])
+        # 更新信号点逻辑以匹配多空
+        long_entry = trade_history_plot[trade_history_plot['action'].str.contains("Open Long", case=False, na=False)]
+        short_entry = trade_history_plot[trade_history_plot['action'].str.contains("Open Short", case=False, na=False)]
+        long_exit = trade_history_plot[trade_history_plot['action'].str.contains("Close Long|Stop Loss Long|End Close Long", case=False, na=False)]
+        short_exit = trade_history_plot[trade_history_plot['action'].str.contains("Cover Short|Stop Loss Short|End Cover Short|Liquidation", case=False, na=False)] # Liquidation 也算退出
+
+        long_entry = long_entry[long_entry['timestamp'].isin(plot_price_df['timestamp'])]
+        short_entry = short_entry[short_entry['timestamp'].isin(plot_price_df['timestamp'])]
+        long_exit = long_exit[long_exit['timestamp'].isin(plot_price_df['timestamp'])]
+        short_exit = short_exit[short_exit['timestamp'].isin(plot_price_df['timestamp'])]
+
+        ax1.plot(long_entry['timestamp'], long_entry['price'], '^', markersize=8, color='lime', label='开多仓', alpha=0.8, linestyle='None')
+        ax1.plot(long_exit['timestamp'], long_exit['price'], 'x', markersize=8, color='green', label='平多仓', alpha=0.8, linestyle='None')
+        ax1.plot(short_entry['timestamp'], short_entry['price'], 'v', markersize=8, color='red', label='开空仓', alpha=0.8, linestyle='None')
+        ax1.plot(short_exit['timestamp'], short_exit['price'], 'x', markersize=8, color='magenta', label='平空仓', alpha=0.8, linestyle='None')
+
+
+    ax1.set_ylabel('价格 (USDT)', fontsize=12); ax1.legend(loc='upper left'); ax1.grid(True, linestyle='--', alpha=0.5)
+
+    equity_curve = step_history_df.set_index('timestamp')['equity']
+    ax2.plot(equity_curve.index, equity_curve, label='账户权益', color='darkorange', linewidth=1.5)
+    ax2.set_xlabel('时间', fontsize=12); ax2.set_ylabel('权益 (USDT)', fontsize=12); ax2.legend(loc='upper left'); ax2.grid(True, linestyle='--', alpha=0.5)
+    ax2.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d')); plt.xticks(rotation=45, ha='right')
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    try:
+        plt.rcParams['font.sans-serif'] = ['SimHei']; plt.rcParams['axes.unicode_minus'] = False
+    except Exception as font_e: print(f"设置中文字体失败: {font_e}.")
+    plt.show()
+
+
+# ==============================================================================
+# 8. 一键式执行与评估
+# ==============================================================================
+print("开始执行一键式评估...")
+
+# --- 创建测试环境 (使用 Price Trailing 奖励) ---
+try:
+    test_env = TradingEnv(
+        df=test_df_scaled,
+        df_raw=test_df_raw,
+        indicator_cols=indicator_cols,
+        window_size=window_size, # 使用更新后的 window_size = 128
+        initial_balance=10000,
+        commission_rate=0.001,
+        spread=0.0001, # 更新 spread
+        leverage=1.0, # 更新 leverage
+        margin_call_threshold=0.5,
+        pt_margin=pt_margin, # 使用训练时定义的参数
+        pt_step=pt_step,
+        a_trail=a_trail,
+        a_pnl=a_pnl,
+        a_fee=a_fee,
+        sigma_z=sigma_z,
+        mu_abs_z=mu_abs_z
+    )
+    print("测试环境创建成功。")
+except ValueError as e:
+    print(f"创建测试环境时出错: {e}")
+    exit()
+
+# --- 加载训练好的 PPO Agent ---
+ppo_agent = None
+if os.path.exists(f"{model_save_path}.zip"):
+    try:
+        ppo_agent = PPO.load(model_save_path, device=ppo_params['device'])
+        print(f"成功加载 PPO 模型: {model_save_path}")
+    except Exception as e: print(f"加载 PPO 模型失败: {e}")
+else: print(f"警告：找不到已保存的 PPO 模型文件 {model_save_path}.zip。")
+
+all_results = {}
+
+# --- 评估 PPO Agent ---
+if ppo_agent:
+    print("\n--- 评估 PPO Agent ---")
+    # 重新创建测试环境以确保状态纯净
+    test_env_ppo = TradingEnv(
+        df=test_df_scaled, df_raw=test_df_raw, indicator_cols=indicator_cols,
+        window_size=window_size, initial_balance=10000, commission_rate=0.001,
+        spread=0.0001, leverage=1.0, margin_call_threshold=0.5, # 使用更新后的参数
+        pt_margin=pt_margin, pt_step=pt_step, a_trail=a_trail, a_pnl=a_pnl, a_fee=a_fee,
+        sigma_z=sigma_z, mu_abs_z=mu_abs_z
+    )
+    ppo_results, ppo_step_history, ppo_trade_history, ppo_final_equity = evaluate_agent(ppo_agent, test_env_ppo)
+    all_results['PPO (PriceTrail)'] = ppo_results # 标记使用了 Price Trailing
+    print("PPO (PriceTrail) 评估结果:")
+    for key, value in ppo_results.items(): print(f"  {key}: {value:.4f}")
+    print(f"PPO (PriceTrail) 最终权益: {ppo_final_equity:.2f}")
+    plot_trading_results(test_df_raw, ppo_step_history, ppo_trade_history, title="PPO Agent (Price Trailing) 交易结果")
+else: print("跳过 PPO Agent 评估。")
+
+
+# --- 评估 HODL 策略 ---
+print("\n--- 评估 HODL 策略 ---")
+hodl_results, hodl_step_history, hodl_final_equity = hodl_strategy(test_df_raw, initial_balance=10000, commission_rate=0.001)
+all_results['HODL'] = hodl_results
+print("HODL 评估结果:")
+for key, value in hodl_results.items(): print(f"  {key}: {value:.4f}")
+print(f"HODL 最终权益: {hodl_final_equity:.2f}")
+# plot_trading_results(test_df_raw, hodl_step_history, pd.DataFrame(), title="HODL 策略结果")
+
+
+# --- 评估 SMA Crossover 策略 (多空) ---
+print("\n--- 评估 SMA Crossover 策略 (多空) ---")
+# 更新: 使用新的 short_window 和 long_window 调用
+sma_results, sma_step_history, sma_trade_history, sma_final_equity = sma_crossover_strategy(
+    df_raw=test_df_raw, initial_balance=10000, commission_rate=0.001,
+    short_window=50, long_window=200 # 使用更新后的参数
+)
+all_results['SMA Crossover (50/200)'] = sma_results # 更新标签
+print("SMA Crossover (50/200) 评估结果:")
+for key, value in sma_results.items(): print(f"  {key}: {value:.4f}")
+print(f"SMA Crossover (50/200) 最终权益: {sma_final_equity:.2f}")
+plot_trading_results(test_df_raw, sma_step_history, sma_trade_history, title="SMA Crossover (50/200) 策略交易结果")
+
+
+# --- 结果汇总对比 ---
+print("\n--- 策略评估结果汇总 ---")
+results_df = pd.DataFrame(all_results).T
+pd.set_option('display.float_format', '{:.4f}'.format)
+print(results_df)
+
+print("\n评估完成！")
+
